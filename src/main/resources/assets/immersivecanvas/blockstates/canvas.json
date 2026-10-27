@@ -1,0 +1,10 @@
+{
+  "variants": {
+    "facing=north": { "model": "immersivecanvas:block/canvas" },
+    "facing=east":  { "model": "immersivecanvas:block/canvas", "y": 90 },
+    "facing=south": { "model": "immersivecanvas:block/canvas", "y": 180 },
+    "facing=west":  { "model": "immersivecanvas:block/canvas", "y": 270 },
+    "facing=up":    { "model": "immersivecanvas:block/canvas", "x": 270 },
+    "facing=down":  { "model": "immersivecanvas:block/canvas", "x": 90 }
+  }
+}

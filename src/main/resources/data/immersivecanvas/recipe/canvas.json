@@ -1,0 +1,7 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "pattern": [ "SSS", "SWS", "SSS" ],
+  "key": { "S": "minecraft:stick", "W": "minecraft:white_wool" },
+  "result": { "id": "immersivecanvas:canvas", "count": 1 }
+}

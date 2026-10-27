@@ -1,0 +1,22 @@
+{
+  "type": "minecraft:block",
+  "pools": [
+    {
+      "rolls": 1,
+      "conditions": [ { "condition": "minecraft:survives_explosion" } ],
+      "entries": [
+        {
+          "type": "minecraft:item",
+          "name": "immersivecanvas:canvas",
+          "functions": [
+            {
+              "function": "minecraft:copy_components",
+              "source": "block_entity",
+              "include": [ "immersivecanvas:canvas_data" ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

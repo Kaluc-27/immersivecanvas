@@ -1,0 +1,18 @@
+{
+  "block.immersivecanvas.canvas": "Canevas",
+  "gui.immersivecanvas.title": "Éditeur de canevas",
+  "gui.immersivecanvas.tool.pencil": "Crayon",
+  "gui.immersivecanvas.tool.eraser": "Gomme",
+  "gui.immersivecanvas.tool.fill": "Seau",
+  "gui.immersivecanvas.tool.picker": "Pipette",
+  "gui.immersivecanvas.undo": "Annuler",
+  "gui.immersivecanvas.redo": "Rétablir",
+  "gui.immersivecanvas.clear": "Effacer",
+  "gui.immersivecanvas.import": "Importer",
+  "gui.immersivecanvas.browse": "Parcourir",
+  "gui.immersivecanvas.save": "Enregistrer",
+  "gui.immersivecanvas.cancel": "Annuler",
+  "gui.immersivecanvas.path": "Chemin de l'image (png/jpg/gif/bmp)",
+  "gui.immersivecanvas.imported": "Image importée",
+  "gui.immersivecanvas.import_error": "Échec de l'import : %s"
+}
