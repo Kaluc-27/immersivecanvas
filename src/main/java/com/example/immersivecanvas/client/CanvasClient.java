@@ -42,11 +42,15 @@ public final class CanvasClient {
         if (++tickCounter >= 100) {
             tickCounter = 0;
             CanvasTextures.cleanup();
+            MediaClient.cleanup();
         }
     }
 
     @SubscribeEvent
     static void onLevelUnload(LevelEvent.Unload event) {
-        if (event.getLevel().isClientSide()) CanvasTextures.clear();
+        if (event.getLevel().isClientSide()) {
+            CanvasTextures.clear();
+            MediaClient.clear();
+        }
     }
 }

@@ -47,7 +47,8 @@ public class CanvasRenderer implements BlockEntityRenderer<CanvasBlockEntity, Ca
     public static class State extends BlockEntityRenderState {
         public Identifier texture;
         public Direction facing = Direction.NORTH;
-        public int bw = 1, bh = 1, style = 0;
+        public boolean media;
+        public int bw = 1, bh = 1, style = 0, fit = 0, mw = 1, mh = 1;
     }
 
     public CanvasRenderer(BlockEntityRendererProvider.Context context) {}
@@ -65,18 +66,30 @@ public class CanvasRenderer implements BlockEntityRenderer<CanvasBlockEntity, Ca
         if (!CanvasBlock.isMaster(bs)) return;
 
         CanvasData d = be.getData();
-        Identifier tex = CanvasTextures.get(be);
-        if (tex != null && d.isValid()) {
-            state.texture = tex;
+        state.media = false;
+        state.fit = 0;
+        if (d.isValid()) {
             state.bw = d.bw();
             state.bh = d.bh();
             state.style = d.style();
+            if (d.isPixel()) {
+                state.texture = CanvasTextures.get(be);
+            } else {
+                state.media = true;
+                state.fit = d.fit();
+                state.mw = d.mw();
+                state.mh = d.mh();
+                state.texture = MediaClient.texture(d.media(), d.mode());
+            }
         } else {
-            // canevas vierge : toile unie 1x1
-            state.texture = BLANK;
             state.bw = 1;
             state.bh = 1;
             state.style = 0;
+        }
+        if (state.texture == null) {
+            // vierge, ou image HD en cours de chargement : toile unie
+            state.media = false;
+            state.texture = BLANK;
         }
     }
 
@@ -109,12 +122,46 @@ public class CanvasRenderer implements BlockEntityRenderer<CanvasBlockEntity, Ca
         final float yt = bh - inset;
         final float yb = inset;
 
-        collector.submitCustomGeometry(poseStack, RenderTypes.entityCutoutNoCull(state.texture), (pose, vc) -> {
-            vertex(vc, pose, light, xl, yt, zImg, 0f, 0f, 0f, 0f, -1f);
-            vertex(vc, pose, light, xl, yb, zImg, 0f, 1f, 0f, 0f, -1f);
-            vertex(vc, pose, light, xr, yb, zImg, 1f, 1f, 0f, 0f, -1f);
-            vertex(vc, pose, light, xr, yt, zImg, 1f, 0f, 0f, 0f, -1f);
-        });
+        if (!state.media) {
+            collector.submitCustomGeometry(poseStack, RenderTypes.entityCutoutNoCull(state.texture), (pose, vc) ->
+                    quad(vc, pose, light, xl, xr, yt, yb, zImg, 0f, 0f, 1f, 1f));
+        } else {
+            // image HD : recadrer (0), ajuster avec bandes (1) ou étirer (2)
+            float boxW = xl - xr, boxH = yt - yb;
+            double boxAspect = boxW / (double) boxH, imgAspect = state.mw / (double) state.mh;
+            float qxl = xl, qxr = xr, qyt = yt, qyb = yb;
+            float u0 = 0f, v0 = 0f, u1 = 1f, v1 = 1f;
+            if (state.fit == 0) {
+                if (imgAspect > boxAspect) {
+                    float vis = (float) (boxAspect / imgAspect);
+                    u0 = (1f - vis) / 2f;
+                    u1 = u0 + vis;
+                } else {
+                    float vis = (float) (imgAspect / boxAspect);
+                    v0 = (1f - vis) / 2f;
+                    v1 = v0 + vis;
+                }
+            } else if (state.fit == 1) {
+                float cx = (xl + xr) / 2f, cy = (yt + yb) / 2f, hw, hh;
+                if (imgAspect > boxAspect) {
+                    hw = boxW / 2f;
+                    hh = (float) (boxW / imgAspect) / 2f;
+                } else {
+                    hh = boxH / 2f;
+                    hw = (float) (boxH * imgAspect) / 2f;
+                }
+                qxl = cx + hw;
+                qxr = cx - hw;
+                qyt = cy + hh;
+                qyb = cy - hh;
+                collector.submitCustomGeometry(poseStack, RenderTypes.entityCutoutNoCull(BLANK), (pose, vc) ->
+                        quad(vc, pose, light, xl, xr, yt, yb, zImg, 0f, 0f, 1f, 1f));
+            }
+            final float fxl = qxl, fxr = qxr, fyt = qyt, fyb = qyb, fu0 = u0, fv0 = v0, fu1 = u1, fv1 = v1;
+            final float zTop = zImg - (state.fit == 1 ? 0.001f : 0f);
+            collector.submitCustomGeometry(poseStack, RenderTypes.entityCutoutNoCull(state.texture), (pose, vc) ->
+                    quad(vc, pose, light, fxl, fxr, fyt, fyb, zTop, fu0, fv0, fu1, fv1));
+        }
 
         if (framed) {
             collector.submitCustomGeometry(poseStack, RenderTypes.entityCutoutNoCull(FRAME_TEXTURES[state.style]),
@@ -122,6 +169,16 @@ public class CanvasRenderer implements BlockEntityRenderer<CanvasBlockEntity, Ca
         }
 
         poseStack.popPose();
+    }
+
+    /** Rectangle face au nord : left/right en x (left > right), top/bottom en y. */
+    private static void quad(VertexConsumer vc, PoseStack.Pose pose, int light,
+                             float left, float right, float top, float bottom, float z,
+                             float u0, float v0, float u1, float v1) {
+        vertex(vc, pose, light, left, top, z, u0, v0, 0f, 0f, -1f);
+        vertex(vc, pose, light, left, bottom, z, u0, v1, 0f, 0f, -1f);
+        vertex(vc, pose, light, right, bottom, z, u1, v1, 0f, 0f, -1f);
+        vertex(vc, pose, light, right, top, z, u1, v0, 0f, 0f, -1f);
     }
 
     private static void drawFrame(VertexConsumer vc, PoseStack.Pose pose, int light, int bw, int bh, float zBack) {

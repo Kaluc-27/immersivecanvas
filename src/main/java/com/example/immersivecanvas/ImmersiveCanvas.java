@@ -53,7 +53,11 @@ public class ImmersiveCanvas {
     }
 
     private void registerPayloads(RegisterPayloadHandlersEvent event) {
-        event.registrar("1").playToServer(SaveCanvasPayload.TYPE, SaveCanvasPayload.STREAM_CODEC, SaveCanvasPayload::handle);
+        var registrar = event.registrar("2");
+        registrar.playToServer(SaveCanvasPayload.TYPE, SaveCanvasPayload.STREAM_CODEC, SaveCanvasPayload::handle);
+        registrar.playToServer(MediaUploadPayload.TYPE, MediaUploadPayload.STREAM_CODEC, MediaUploadPayload::handle);
+        registrar.playToServer(MediaRequestPayload.TYPE, MediaRequestPayload.STREAM_CODEC, MediaRequestPayload::handle);
+        registrar.playToClient(MediaChunkPayload.TYPE, MediaChunkPayload.STREAM_CODEC, MediaChunkPayload::handle);
     }
 
     private void addToCreativeTab(BuildCreativeModeTabContentsEvent event) {

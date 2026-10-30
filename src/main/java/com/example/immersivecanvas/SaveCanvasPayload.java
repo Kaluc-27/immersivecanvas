@@ -4,6 +4,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.network.codec.ByteBufCodecs;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
@@ -85,10 +87,23 @@ public record SaveCanvasPayload(BlockPos pos, int index, int total, byte[] data)
             return;
         }
         // Ne jamais faire confiance au client
-        if (!data.isValid() || data.unpackFrames() == null) return;
+        if (!data.isValid()) return;
         Level level = player.level();
         if (!level.isLoaded(pos)) return;
         if (player.distanceToSqr(Vec3.atCenterOf(pos)) > 8.0 * 8.0) return;
+        if (data.isPixel()) {
+            if (data.unpackFrames() == null) return;
+        } else {
+            MinecraftServer server = level.getServer();
+            if (server == null) return;
+            byte[] media = MediaStore.read(server, data.media());
+            if (media == null) {
+                player.displayClientMessage(Component.translatable("message.immersivecanvas.media_missing"), true);
+                return;
+            }
+            int[] d = MediaStore.dims(media);
+            if (MediaStore.sniffKind(media) != data.mode() || d == null || d[0] != data.mw() || d[1] != data.mh()) return;
+        }
         CanvasGroup.apply(player, pos, data);
     }
 }

@@ -36,7 +36,7 @@ final class CanvasTextures {
 
     static Identifier get(CanvasBlockEntity be) {
         CanvasData d = be.getData();
-        if (!d.isValid()) {
+        if (!d.isValid() || !d.isPixel()) {
             drop(be);
             return null;
         }
