@@ -1,49 +1,62 @@
 package com.example.immersivecanvas.client;
 
 import com.example.immersivecanvas.CanvasData;
+import com.example.immersivecanvas.ImmersiveCanvas;
 import com.example.immersivecanvas.SaveCanvasPayload;
+import com.mojang.blaze3d.platform.NativeImage;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import net.minecraft.ChatFormatting;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
 import net.minecraft.util.Mth;
 import net.neoforged.neoforge.client.network.ClientPacketDistributor;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.util.tinyfd.TinyFileDialogs;
 
-import javax.imageio.ImageIO;
-import java.awt.image.BufferedImage;
 import java.io.File;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
+import java.util.List;
 import java.util.function.DoubleConsumer;
 
-/** Éditeur de pixel-art : crayon, gomme, seau, pipette, undo/redo, couleurs HSV/hex, import d'image. */
+/**
+ * Éditeur de pixel-art : crayon, gomme, seau, pipette, annuler/rétablir, couleurs HSV/hex/palette,
+ * grands tableaux (jusqu'à 4x4 blocs), 16/32/64 px par bloc, images multiples (GIF animé), import d'image.
+ */
 public class CanvasEditorScreen extends Screen {
-    private record Snap(int res, int[] px) {}
+    private record Snap(int bw, int bh, int ppb, int style, List<int[]> frames, List<Integer> delays, int cur) {}
 
     private enum Tool { PENCIL, ERASER, FILL, PICKER }
 
-    private static final int[] SIZES = {16, 32, 64};
     private static final int WHITE = 0xFFFFFF;
     private static final int[] PALETTE = {
             0x000000, 0x1D2B53, 0x7E2553, 0x008751, 0xAB5236, 0x5F574F, 0xC2C3C7, 0xFFF1E8,
             0xFF004D, 0xFFA300, 0xFFEC27, 0x00E436, 0x29ADFF, 0x83769C, 0xFF77A8, 0xFFCCAA,
             0xFFFFFF, 0x9B2226, 0xCA6702, 0xE9D8A6, 0x94D2BD, 0x0A9396, 0x005F73, 0x001219,
             0x3A0CA3, 0x7209B7, 0xF72585, 0x4CC9F0, 0x6A994E, 0x386641, 0x8D6E63, 0x4E342E};
-    private static final int SW = 12; // taille d'une pastille de palette
-    private static final int MAX_UNDO = 64;
+    private static final int SW = 12;
+    private static int texCounter = 0;
 
     private final BlockPos pos;
-    private int res;
-    private int[] px;
+    private int bw, bh, ppb, style, W, H;
+    private final List<int[]> frames = new ArrayList<>();
+    private final List<Integer> delays = new ArrayList<>();
+    private int cur = 0;
+
     private final Deque<Snap> undo = new ArrayDeque<>();
     private final Deque<Snap> redo = new ArrayDeque<>();
 
@@ -52,41 +65,82 @@ public class CanvasEditorScreen extends Screen {
     private float hue, sat, val;
     private boolean painting;
     private int lastX, lastY;
+    private boolean playing;
+    private long playStart;
+    private ImageImporter.Fit fit = ImageImporter.Fit.CROP;
     private String pathText = "";
     private Component status = Component.empty();
-    private boolean updatingHex;
+    private boolean updatingHex, updatingDelay;
 
-    // mise en page (recalculée dans init)
-    private int gx, gy, cell, panelX, paletteY;
+    // texture de l'éditeur
+    private DynamicTexture tex;
+    private Identifier texId;
+    private int texW, texH;
+    private boolean texDirty = true, texUpload = false;
+
+    // mise en page
+    private int gx, gy, panelX, paletteY, texScale, dispW, dispH;
+    private double zoom;
     private final Button[] toolButtons = new Button[Tool.values().length];
+    private Button playButton;
     private HsvSlider hSlider, sSlider, vSlider;
-    private EditBox hexBox, pathBox;
+    private EditBox hexBox, pathBox, delayBox, wBox, hBox;
 
     public CanvasEditorScreen(BlockPos pos, CanvasData data) {
         super(Component.translatable("gui.immersivecanvas.title"));
         this.pos = pos;
-        if (data.isValid()) {
-            res = data.res();
-            px = data.toPixels();
+        byte[][] raw = data.isValid() ? data.unpackFrames() : null;
+        if (raw != null) {
+            bw = data.bw();
+            bh = data.bh();
+            ppb = data.ppb();
+            style = data.style();
+            for (int i = 0; i < raw.length; i++) {
+                frames.add(CanvasData.toInts(raw[i]));
+                delays.add(data.delays()[i]);
+            }
         } else {
-            res = 32;
-            px = new int[res * res];
-            Arrays.fill(px, WHITE);
+            bw = 1;
+            bh = 1;
+            ppb = 32;
+            int[] blank = new int[ppb * ppb];
+            Arrays.fill(blank, WHITE);
+            frames.add(blank);
+            delays.add(100);
         }
+        W = bw * ppb;
+        H = bh * ppb;
     }
 
     @Override
     public boolean isPauseScreen() { return false; }
 
+    private int[] px() { return frames.get(cur); }
+
+    private int maxFramesAllowed() {
+        return Math.max(1, Math.min(CanvasData.MAX_FRAMES, CanvasData.MAX_RAW / (W * H * 3)));
+    }
+
     // ------------------------------------------------------------------ widgets
 
     @Override
     protected void init() {
-        cell = Math.max(2, Math.min((height - 80) / res, (width - 260) / res));
+        int availW = Math.max(64, width - 270), availH = Math.max(64, height - 90);
+        double fitZoom = Math.min(availW / (double) W, availH / (double) H);
+        if (fitZoom >= 1) {
+            texScale = Math.min(32, (int) fitZoom);
+            zoom = texScale;
+        } else {
+            texScale = 1;
+            zoom = fitZoom;
+        }
+        dispW = Math.max(1, (int) Math.round(W * zoom));
+        dispH = Math.max(1, (int) Math.round(H * zoom));
         gx = 10;
         gy = 18;
-        panelX = gx + cell * res + 14;
+        panelX = gx + dispW + 14;
         int w = 192;
+        ensureTexture();
 
         Tool[] tools = Tool.values();
         for (int i = 0; i < tools.length; i++) {
@@ -102,35 +156,79 @@ public class CanvasEditorScreen extends Screen {
                 .bounds(panelX, 40, 46, 18).build());
         addRenderableWidget(Button.builder(Component.translatable("gui.immersivecanvas.redo"), b -> redo())
                 .bounds(panelX + 48, 40, 46, 18).build());
-        addRenderableWidget(Button.builder(Component.translatable("gui.immersivecanvas.clear"), b -> clearCanvas())
+        addRenderableWidget(Button.builder(Component.translatable("gui.immersivecanvas.clear"), b -> clearFrame())
                 .bounds(panelX + 96, 40, 46, 18).build());
-        addRenderableWidget(Button.builder(Component.literal(res + "px"), b -> cycleSize())
+        playButton = addRenderableWidget(Button.builder(playLabel(), b -> togglePlay())
                 .bounds(panelX + 144, 40, 46, 18).build());
 
-        hSlider = addRenderableWidget(new HsvSlider(panelX, 64, w, 20, "H", hue, v -> { hue = (float) v; fromHsv(); }));
-        sSlider = addRenderableWidget(new HsvSlider(panelX, 86, w, 20, "S", sat, v -> { sat = (float) v; fromHsv(); }));
-        vSlider = addRenderableWidget(new HsvSlider(panelX, 108, w, 20, "V", val, v -> { val = (float) v; fromHsv(); }));
+        wBox = addRenderableWidget(new EditBox(font, panelX, 62, 34, 18, Component.literal("L")));
+        wBox.setMaxLength(2);
+        wBox.setFilter(t -> t.matches("[0-9]*"));
+        wBox.setValue(String.valueOf(bw));
+        hBox = addRenderableWidget(new EditBox(font, panelX + 46, 62, 34, 18, Component.literal("H")));
+        hBox.setMaxLength(2);
+        hBox.setFilter(t -> t.matches("[0-9]*"));
+        hBox.setValue(String.valueOf(bh));
+        addRenderableWidget(Button.builder(Component.translatable("gui.immersivecanvas.ppb", ppb), b -> resize(bw, bh, nextPpb()))
+                .bounds(panelX + 84, 62, 50, 18).build());
+        addRenderableWidget(Button.builder(Component.translatable("gui.immersivecanvas.apply"), b -> applySize())
+                .bounds(panelX + 138, 62, 52, 18).build());
 
-        hexBox = addRenderableWidget(new EditBox(font, panelX, 134, 70, 18, Component.literal("hex")));
+        addRenderableWidget(Button.builder(Component.literal("<"), b -> gotoFrame(cur - 1))
+                .bounds(panelX, 84, 46, 18).build());
+        addRenderableWidget(Button.builder(Component.literal(">"), b -> gotoFrame(cur + 1))
+                .bounds(panelX + 48, 84, 46, 18).build());
+        addRenderableWidget(Button.builder(Component.literal("+"), b -> addFrame())
+                .bounds(panelX + 96, 84, 46, 18).build());
+        addRenderableWidget(Button.builder(Component.literal("-"), b -> delFrame())
+                .bounds(panelX + 144, 84, 46, 18).build());
+
+        delayBox = addRenderableWidget(new EditBox(font, panelX + 62, 106, 56, 16, Component.literal("ms")));
+        delayBox.setMaxLength(5);
+        delayBox.setFilter(s -> s.matches("[0-9]*"));
+        delayBox.setResponder(s -> {
+            if (updatingDelay || s.isEmpty()) return;
+            try {
+                delays.set(cur, Mth.clamp(Integer.parseInt(s), CanvasData.MIN_DELAY, CanvasData.MAX_DELAY));
+            } catch (NumberFormatException ignored) {}
+        });
+        syncDelayBox();
+        addRenderableWidget(Button.builder(Component.translatable("gui.immersivecanvas.delay_all"), b -> {
+            int d = delays.get(cur);
+            for (int i = 0; i < delays.size(); i++) delays.set(i, d);
+        }).bounds(panelX + 122, 105, 46, 18).build());
+
+        hSlider = addRenderableWidget(new HsvSlider(panelX, 128, w, 16, "H", hue, v -> { hue = (float) v; fromHsv(); }));
+        sSlider = addRenderableWidget(new HsvSlider(panelX, 146, w, 16, "S", sat, v -> { sat = (float) v; fromHsv(); }));
+        vSlider = addRenderableWidget(new HsvSlider(panelX, 164, w, 16, "V", val, v -> { val = (float) v; fromHsv(); }));
+
+        hexBox = addRenderableWidget(new EditBox(font, panelX, 186, 70, 18, Component.literal("hex")));
         hexBox.setMaxLength(6);
         hexBox.setFilter(s -> s.matches("[0-9a-fA-F]*"));
         hexBox.setValue(String.format("%06X", color));
         hexBox.setResponder(s -> {
             if (!updatingHex && s.length() == 6) setColor(Integer.parseInt(s, 16), true);
         });
-        paletteY = 158;
+        paletteY = 210;
 
-        // ligne d'import + boutons du bas
         int by = height - 52;
-        pathBox = addRenderableWidget(new EditBox(font, 10, by, 200, 18, Component.translatable("gui.immersivecanvas.path")));
+        pathBox = addRenderableWidget(new EditBox(font, 10, by, 170, 18, Component.translatable("gui.immersivecanvas.path")));
         pathBox.setMaxLength(512);
         pathBox.setHint(Component.translatable("gui.immersivecanvas.path"));
         pathBox.setValue(pathText);
         pathBox.setResponder(s -> pathText = s);
         addRenderableWidget(Button.builder(Component.translatable("gui.immersivecanvas.browse"), b -> browse())
-                .bounds(214, by, 60, 18).build());
+                .bounds(184, by, 56, 18).build());
         addRenderableWidget(Button.builder(Component.translatable("gui.immersivecanvas.import"), b -> importImage(pathText))
-                .bounds(278, by, 60, 18).build());
+                .bounds(244, by, 56, 18).build());
+        addRenderableWidget(Button.builder(fitLabel(), b -> {
+            fit = ImageImporter.Fit.values()[(fit.ordinal() + 1) % ImageImporter.Fit.values().length];
+            b.setMessage(fitLabel());
+        }).bounds(304, by, 60, 18).build());
+        addRenderableWidget(Button.builder(styleLabel(), b -> {
+            style = (style + 1) % CanvasData.STYLES;
+            b.setMessage(styleLabel());
+        }).bounds(368, by, 100, 18).build());
 
         addRenderableWidget(Button.builder(Component.translatable("gui.immersivecanvas.save"), b -> save())
                 .bounds(10, height - 28, 90, 20).build());
@@ -150,7 +248,42 @@ public class CanvasEditorScreen extends Screen {
         }
     }
 
-    /** Slider 0..1 avec callback. */
+    private Component playLabel() {
+        return Component.translatable(playing ? "gui.immersivecanvas.stop" : "gui.immersivecanvas.play");
+    }
+
+    private Component fitLabel() {
+        return Component.translatable("gui.immersivecanvas.fit." + fit.name().toLowerCase());
+    }
+
+    private Component styleLabel() {
+        return Component.translatable("gui.immersivecanvas.style", Component.translatable("gui.immersivecanvas.style." + style));
+    }
+
+    /** Résolution suivante, en sautant celles qui dépasseraient la limite de pixels pour la taille actuelle. */
+    private int nextPpb() {
+        int[] list = CanvasData.PPBS;
+        int idx = 0;
+        for (int i = 0; i < list.length; i++) if (list[i] == ppb) idx = i;
+        for (int k = 1; k <= list.length; k++) {
+            int cand = list[(idx + k) % list.length];
+            if ((long) bw * cand * bh * cand * 3 <= CanvasData.MAX_RAW) return cand;
+        }
+        return ppb;
+    }
+
+    private void applySize() {
+        try {
+            int nbw = Mth.clamp(Integer.parseInt(wBox.getValue()), 1, CanvasData.MAX_BLOCKS);
+            int nbh = Mth.clamp(Integer.parseInt(hBox.getValue()), 1, CanvasData.MAX_BLOCKS);
+            if (nbw != bw || nbh != bh) resize(nbw, nbh, ppb);
+            else { wBox.setValue(String.valueOf(bw)); hBox.setValue(String.valueOf(bh)); }
+        } catch (NumberFormatException ignored) {
+            wBox.setValue(String.valueOf(bw));
+            hBox.setValue(String.valueOf(bh));
+        }
+    }
+
     private static final class HsvSlider extends AbstractSliderButton {
         private final String label;
         private final DoubleConsumer onChange;
@@ -174,6 +307,62 @@ public class CanvasEditorScreen extends Screen {
         @Override protected void applyValue() {
             if (onChange != null) onChange.accept(value);
         }
+    }
+
+    // ------------------------------------------------------------------ texture de l'éditeur
+
+    private void ensureTexture() {
+        int tw = W * texScale, th = H * texScale;
+        if (tex != null && texW == tw && texH == th) return;
+        releaseTexture();
+        texW = tw;
+        texH = th;
+        int n = texCounter++;
+        tex = new DynamicTexture(() -> "immersivecanvas/editor" + n, new NativeImage(tw, th, false));
+        texId = Identifier.fromNamespaceAndPath(ImmersiveCanvas.MODID, "editor/" + n);
+        Minecraft.getInstance().getTextureManager().register(texId, tex);
+        texDirty = true;
+    }
+
+    private void releaseTexture() {
+        if (tex != null && texId != null) {
+            Minecraft.getInstance().getTextureManager().release(texId);
+        }
+        tex = null;
+        texId = null;
+    }
+
+    private void repaintAll() {
+        NativeImage img = tex.getPixels();
+        if (img == null) return;
+        int[] p = px();
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int argb = 0xFF000000 | p[y * W + x];
+                for (int dy = 0; dy < texScale; dy++)
+                    for (int dx = 0; dx < texScale; dx++)
+                        img.setPixel(x * texScale + dx, y * texScale + dy, argb);
+            }
+        }
+        tex.upload();
+        texDirty = false;
+        texUpload = false;
+    }
+
+    private void paintCell(int x, int y) {
+        NativeImage img = tex.getPixels();
+        if (img == null) return;
+        int argb = 0xFF000000 | px()[y * W + x];
+        for (int dy = 0; dy < texScale; dy++)
+            for (int dx = 0; dx < texScale; dx++)
+                img.setPixel(x * texScale + dx, y * texScale + dy, argb);
+        texUpload = true;
+    }
+
+    @Override
+    public void removed() {
+        releaseTexture();
+        super.removed();
     }
 
     // ------------------------------------------------------------------ couleurs
@@ -200,6 +389,13 @@ public class CanvasEditorScreen extends Screen {
         updatingHex = false;
     }
 
+    private void syncDelayBox() {
+        if (delayBox == null) return;
+        updatingDelay = true;
+        delayBox.setValue(String.valueOf(delays.get(cur)));
+        updatingDelay = false;
+    }
+
     private static float[] rgbToHsv(int rgb) {
         float r = ((rgb >> 16) & 255) / 255f, g = ((rgb >> 8) & 255) / 255f, b = (rgb & 255) / 255f;
         float max = Math.max(r, Math.max(g, b)), min = Math.min(r, Math.min(g, b)), d = max - min;
@@ -212,21 +408,36 @@ public class CanvasEditorScreen extends Screen {
         return new float[]{h, max == 0 ? 0 : d / max, max};
     }
 
-    // ------------------------------------------------------------------ undo / redo
+    // ------------------------------------------------------------------ historique
 
-    private Snap snapshot() { return new Snap(res, px.clone()); }
+    private Snap snapshot() {
+        List<int[]> copy = new ArrayList<>(frames.size());
+        for (int[] f : frames) copy.add(f.clone());
+        return new Snap(bw, bh, ppb, style, copy, new ArrayList<>(delays), cur);
+    }
 
     private void pushUndo() {
         undo.push(snapshot());
-        while (undo.size() > MAX_UNDO) undo.removeLast();
+        int max = Math.max(4, Math.min(40, 24_000_000 / Math.max(1, frames.size() * W * H * 4)));
+        while (undo.size() > max) undo.removeLast();
         redo.clear();
     }
 
     private void restore(Snap s) {
-        boolean resChanged = s.res() != res;
-        res = s.res();
-        px = s.px().clone();
-        if (resChanged) rebuildWidgets();
+        boolean dimsChanged = s.bw() != bw || s.bh() != bh || s.ppb() != ppb;
+        bw = s.bw();
+        bh = s.bh();
+        ppb = s.ppb();
+        style = s.style();
+        W = bw * ppb;
+        H = bh * ppb;
+        frames.clear();
+        for (int[] f : s.frames()) frames.add(f.clone());
+        delays.clear();
+        delays.addAll(s.delays());
+        cur = Math.min(s.cur(), frames.size() - 1);
+        texDirty = true;
+        if (dimsChanged) rebuildWidgets(); else syncDelayBox();
     }
 
     private void undo() {
@@ -241,22 +452,82 @@ public class CanvasEditorScreen extends Screen {
         restore(redo.pop());
     }
 
-    private void clearCanvas() {
+    private void clearFrame() {
         pushUndo();
-        Arrays.fill(px, WHITE);
+        Arrays.fill(px(), WHITE);
+        texDirty = true;
     }
 
-    private void cycleSize() {
-        int idx = 0;
-        for (int i = 0; i < SIZES.length; i++) if (SIZES[i] == res) idx = i;
-        int nr = SIZES[(idx + 1) % SIZES.length];
+    // ------------------------------------------------------------------ images (frames) / taille
+
+    private void gotoFrame(int idx) {
+        playing = false;
+        if (playButton != null) playButton.setMessage(playLabel());
+        cur = Math.floorMod(idx, frames.size());
+        texDirty = true;
+        syncDelayBox();
+    }
+
+    private void addFrame() {
+        if (frames.size() >= maxFramesAllowed()) {
+            status = Component.translatable("gui.immersivecanvas.limit");
+            return;
+        }
         pushUndo();
-        int[] out = new int[nr * nr];
-        for (int y = 0; y < nr; y++)
-            for (int x = 0; x < nr; x++)
-                out[y * nr + x] = px[(y * res / nr) * res + (x * res / nr)];
-        px = out;
-        res = nr;
+        frames.add(cur + 1, px().clone());
+        delays.add(cur + 1, delays.get(cur));
+        gotoFrame(cur + 1);
+    }
+
+    private void delFrame() {
+        if (frames.size() <= 1) return;
+        pushUndo();
+        frames.remove(cur);
+        delays.remove(cur);
+        gotoFrame(Math.min(cur, frames.size() - 1));
+    }
+
+    private void togglePlay() {
+        playing = !playing;
+        playStart = System.currentTimeMillis();
+        playButton.setMessage(playLabel());
+        texDirty = true;
+    }
+
+    private void resize(int nbw, int nbh, int nppb) {
+        nbw = Mth.clamp(nbw, 1, CanvasData.MAX_BLOCKS);
+        nbh = Mth.clamp(nbh, 1, CanvasData.MAX_BLOCKS);
+        boolean reduced = false;
+        while ((long) nbw * nppb * nbh * nppb * 3 > CanvasData.MAX_RAW && nppb > CanvasData.PPBS[0]) {
+            int[] list = CanvasData.PPBS;
+            for (int i = list.length - 1; i > 0; i--) if (list[i] == nppb) { nppb = list[i - 1]; break; }
+            reduced = true;
+        }
+        pushUndo();
+        int nW = nbw * nppb, nH = nbh * nppb;
+        int maxF = Math.max(1, Math.min(CanvasData.MAX_FRAMES, CanvasData.MAX_RAW / (nW * nH * 3)));
+        boolean trimmed = frames.size() > maxF;
+        List<int[]> out = new ArrayList<>();
+        for (int i = 0; i < Math.min(maxF, frames.size()); i++) {
+            int[] src = frames.get(i), dst = new int[nW * nH];
+            for (int y = 0; y < nH; y++)
+                for (int x = 0; x < nW; x++)
+                    dst[y * nW + x] = src[(y * H / nH) * W + (x * W / nW)];
+            out.add(dst);
+        }
+        while (delays.size() > out.size()) delays.remove(delays.size() - 1);
+        frames.clear();
+        frames.addAll(out);
+        bw = nbw;
+        bh = nbh;
+        ppb = nppb;
+        W = nW;
+        H = nH;
+        cur = Math.min(cur, frames.size() - 1);
+        playing = false;
+        if (reduced) status = Component.translatable("gui.immersivecanvas.ppb_reduced", ppb);
+        else if (trimmed) status = Component.translatable("gui.immersivecanvas.trimmed", frames.size());
+        texDirty = true;
         rebuildWidgets();
     }
 
@@ -264,12 +535,13 @@ public class CanvasEditorScreen extends Screen {
 
     private int[] cellAt(double mx, double my) {
         if (mx < gx || my < gy) return null;
-        int cx = (int) Math.floor((mx - gx) / cell), cy = (int) Math.floor((my - gy) / cell);
-        return (cx < res && cy < res) ? new int[]{cx, cy} : null;
+        int cx = (int) Math.floor((mx - gx) / zoom), cy = (int) Math.floor((my - gy) / zoom);
+        return (cx < W && cy < H && mx < gx + dispW && my < gy + dispH) ? new int[]{cx, cy} : null;
     }
 
     private void plot(int x, int y) {
-        px[y * res + x] = tool == Tool.ERASER ? WHITE : color;
+        px()[y * W + x] = tool == Tool.ERASER ? WHITE : color;
+        paintCell(x, y);
     }
 
     private void line(int x0, int y0, int x1, int y1) {
@@ -285,20 +557,22 @@ public class CanvasEditorScreen extends Screen {
     }
 
     private void floodFill(int sx, int sy, int fill) {
-        int target = px[sy * res + sx];
+        int[] p = px();
+        int target = p[sy * W + sx];
         if (target == fill) return;
         Deque<Integer> stack = new ArrayDeque<>();
-        stack.push(sy * res + sx);
+        stack.push(sy * W + sx);
         while (!stack.isEmpty()) {
             int i = stack.pop();
-            if (px[i] != target) continue;
-            px[i] = fill;
-            int x = i % res, y = i / res;
+            if (p[i] != target) continue;
+            p[i] = fill;
+            int x = i % W, y = i / W;
             if (x > 0) stack.push(i - 1);
-            if (x < res - 1) stack.push(i + 1);
-            if (y > 0) stack.push(i - res);
-            if (y < res - 1) stack.push(i + res);
+            if (x < W - 1) stack.push(i + 1);
+            if (y > 0) stack.push(i - W);
+            if (y < H - 1) stack.push(i + W);
         }
+        texDirty = true;
     }
 
     // ------------------------------------------------------------------ souris
@@ -320,18 +594,19 @@ public class CanvasEditorScreen extends Screen {
             setColor(PALETTE[p], false);
             return true;
         }
+        if (playing) return false;
 
         int[] c = cellAt(mx, my);
         if (c == null) return false;
 
-        if (button == 1 || tool == Tool.PICKER) { // clic droit = pipette rapide
-            setColor(px[c[1] * res + c[0]], false);
+        if (button == 1 || tool == Tool.PICKER) {
+            setColor(px()[c[1] * W + c[0]], false);
             if (tool == Tool.PICKER) { tool = Tool.PENCIL; refreshTools(); }
             return true;
         }
         if (button == 0) {
             if (tool == Tool.FILL) {
-                if (px[c[1] * res + c[0]] != color) {
+                if (px()[c[1] * W + c[0]] != color) {
                     pushUndo();
                     floodFill(c[0], c[1], color);
                 }
@@ -371,10 +646,11 @@ public class CanvasEditorScreen extends Screen {
 
     private void browse() {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            PointerBuffer filters = stack.mallocPointer(4);
-            filters.put(stack.UTF8("*.png")).put(stack.UTF8("*.jpg")).put(stack.UTF8("*.jpeg")).put(stack.UTF8("*.bmp"));
+            PointerBuffer filters = stack.mallocPointer(5);
+            filters.put(stack.UTF8("*.gif")).put(stack.UTF8("*.png")).put(stack.UTF8("*.jpg"))
+                    .put(stack.UTF8("*.jpeg")).put(stack.UTF8("*.bmp"));
             filters.flip();
-            String result = TinyFileDialogs.tinyfd_openFileDialog("Import", null, filters, "Images", false);
+            String result = TinyFileDialogs.tinyfd_openFileDialog("Import", null, filters, "Images / GIF", false);
             if (result != null) {
                 pathText = result;
                 pathBox.setValue(result);
@@ -388,78 +664,97 @@ public class CanvasEditorScreen extends Screen {
     private void importImage(String path) {
         if (path == null || path.isBlank()) return;
         try {
-            BufferedImage img = ImageIO.read(new File(path.trim().replace("\"", "")));
-            if (img == null) throw new IllegalArgumentException("format");
-            int[] out = scaleToSquare(img, res);
+            File f = new File(path.trim().replace("\"", ""));
+            ImageImporter.Result r = ImageImporter.load(f, W, H, fit, maxFramesAllowed());
             pushUndo();
-            px = out;
-            status = Component.translatable("gui.immersivecanvas.imported");
+            frames.clear();
+            frames.addAll(r.frames());
+            delays.clear();
+            delays.addAll(r.delays());
+            cur = 0;
+            playing = false;
+            if (playButton != null) playButton.setMessage(playLabel());
+            texDirty = true;
+            syncDelayBox();
+            status = Component.translatable("gui.immersivecanvas.imported", frames.size());
         } catch (Exception e) {
             status = Component.translatable("gui.immersivecanvas.import_error", String.valueOf(e.getMessage()));
         }
     }
 
-    /** Recadre au centre en carré puis réduit en moyennant les pixels (alpha composé sur blanc). */
-    private static int[] scaleToSquare(BufferedImage img, int n) {
-        int w = img.getWidth(), h = img.getHeight(), size = Math.min(w, h);
-        int ox = (w - size) / 2, oy = (h - size) / 2;
-        int[] out = new int[n * n];
-        for (int dy = 0; dy < n; dy++) {
-            int y0 = oy + dy * size / n, y1 = Math.max(y0 + 1, oy + (dy + 1) * size / n);
-            for (int dx = 0; dx < n; dx++) {
-                int x0 = ox + dx * size / n, x1 = Math.max(x0 + 1, ox + (dx + 1) * size / n);
-                long r = 0, g = 0, b = 0;
-                int count = 0;
-                for (int y = y0; y < y1; y++) {
-                    for (int x = x0; x < x1; x++) {
-                        int argb = img.getRGB(x, y);
-                        float a = ((argb >>> 24) & 255) / 255f;
-                        r += (int) (((argb >> 16) & 255) * a + 255 * (1 - a));
-                        g += (int) (((argb >> 8) & 255) * a + 255 * (1 - a));
-                        b += (int) ((argb & 255) * a + 255 * (1 - a));
-                        count++;
-                    }
-                }
-                out[dy * n + dx] = ((int) (r / count) << 16) | ((int) (g / count) << 8) | (int) (b / count);
-            }
-        }
-        return out;
-    }
-
-    // ------------------------------------------------------------------ sauvegarde / rendu
+    // ------------------------------------------------------------------ sauvegarde
 
     private void save() {
-        ClientPacketDistributor.sendToServer(new SaveCanvasPayload(pos, CanvasData.fromPixels(res, px)));
+        int[] d = delays.stream().mapToInt(Integer::intValue).toArray();
+        CanvasData data = CanvasData.pack(bw, bh, ppb, style, d, frames);
+        ByteBuf buf = Unpooled.buffer();
+        CanvasData.STREAM_CODEC.encode(buf, data);
+        byte[] bytes = new byte[buf.readableBytes()];
+        buf.readBytes(bytes);
+        buf.release();
+
+        int total = (bytes.length + SaveCanvasPayload.CHUNK - 1) / SaveCanvasPayload.CHUNK;
+        if (total > SaveCanvasPayload.MAX_CHUNKS) {
+            status = Component.translatable("gui.immersivecanvas.too_big");
+            return;
+        }
+        for (int i = 0; i < total; i++) {
+            int from = i * SaveCanvasPayload.CHUNK;
+            int to = Math.min(bytes.length, from + SaveCanvasPayload.CHUNK);
+            ClientPacketDistributor.sendToServer(new SaveCanvasPayload(pos, i, total, Arrays.copyOfRange(bytes, from, to)));
+        }
         onClose();
     }
+
+    // ------------------------------------------------------------------ rendu
 
     @Override
     public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
         super.render(g, mouseX, mouseY, partialTick);
 
-        g.drawString(font, title, gx, 6, 0xFFFFFFFF);
-
-        // grille
-        int size = cell * res;
-        g.fill(gx - 1, gy - 1, gx + size + 1, gy + size + 1, 0xFF000000);
-        for (int y = 0; y < res; y++) {
-            for (int x = 0; x < res; x++) {
-                int x0 = gx + x * cell, y0 = gy + y * cell;
-                g.fill(x0, y0, x0 + cell, y0 + cell, 0xFF000000 | px[y * res + x]);
+        if (playing && frames.size() > 1) {
+            long cycle = 0;
+            for (int x : delays) cycle += x;
+            long t = (System.currentTimeMillis() - playStart) % Math.max(1, cycle);
+            int idx = 0;
+            for (int i = 0; i < delays.size(); i++) {
+                if (t < delays.get(i)) { idx = i; break; }
+                t -= delays.get(i);
+                idx = i;
+            }
+            if (idx != cur) {
+                cur = idx;
+                texDirty = true;
             }
         }
-        int[] hover = cellAt(mouseX, mouseY);
+
+        g.drawString(font, title, gx, 6, 0xFFFFFFFF);
+
+        // image
+        g.fill(gx - 1, gy - 1, gx + dispW + 1, gy + dispH + 1, 0xFF000000);
+        if (texDirty) repaintAll();
+        else if (texUpload) { tex.upload(); texUpload = false; }
+        g.blit(RenderPipelines.GUI_TEXTURED, texId, gx, gy, 0f, 0f, dispW, dispH, texW, texH, texW, texH);
+
+        int[] hover = playing ? null : cellAt(mouseX, mouseY);
         if (hover != null) {
-            int x0 = gx + hover[0] * cell, y0 = gy + hover[1] * cell;
-            g.fill(x0, y0, x0 + cell, y0 + 1, 0xFFFFFFFF);
-            g.fill(x0, y0 + cell - 1, x0 + cell, y0 + cell, 0xFFFFFFFF);
-            g.fill(x0, y0, x0 + 1, y0 + cell, 0xFFFFFFFF);
-            g.fill(x0 + cell - 1, y0, x0 + cell, y0 + cell, 0xFFFFFFFF);
+            int x0 = gx + (int) Math.floor(hover[0] * zoom), y0 = gy + (int) Math.floor(hover[1] * zoom);
+            int x1 = Math.max(x0 + 1, gx + (int) Math.floor((hover[0] + 1) * zoom));
+            int y1 = Math.max(y0 + 1, gy + (int) Math.floor((hover[1] + 1) * zoom));
+            int o = 0xFFFFFFFF;
+            g.fill(x0, y0, x1, y0 + 1, o);
+            g.fill(x0, y1 - 1, x1, y1, o);
+            g.fill(x0, y0, x0 + 1, y1, o);
+            g.fill(x1 - 1, y0, x1, y1, o);
         }
 
-        // aperçu couleur courante
-        g.fill(panelX + 74, 133, panelX + 100, 153, 0xFFFFFFFF);
-        g.fill(panelX + 75, 134, panelX + 99, 152, 0xFF000000 | color);
+        // image courante + aperçu couleur
+        g.drawString(font, Component.translatable("gui.immersivecanvas.frame", cur + 1, frames.size()),
+                panelX, 110, 0xFFFFFFFF);
+        g.fill(panelX + 74, 185, panelX + 100, 205, 0xFFFFFFFF);
+        g.fill(panelX + 75, 186, panelX + 99, 204, 0xFF000000 | color);
+        g.drawString(font, "x", panelX + 37, 67, 0xFFFFFFFF);
+        g.drawString(font, W + "x" + H + " px", panelX + 108, 191, 0xFFAAAAAA);
 
         // palette
         for (int i = 0; i < PALETTE.length; i++) {
@@ -471,6 +766,6 @@ public class CanvasEditorScreen extends Screen {
             }
         }
 
-        g.drawString(font, status, 344, height - 48, 0xFFFFFFFF);
+        g.drawString(font, status, 10, height - 66, 0xFFFFFFFF);
     }
 }
